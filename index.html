@@ -397,6 +397,22 @@
       100% { background-position: -200% 0; }
     }
 
+    /* LINES PILLS */
+    .stop-lines {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 12px 16px 4px;
+    }
+
+    .line-pill {
+      font-family: 'Space Mono', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+    }
+
     /* NO ARRIVALS */
     .no-arrivals {
       padding: 20px 16px;
@@ -580,7 +596,16 @@
           setStatus('', 'A carregar paragens...');
           const res = await fetch(`${API}/v2/stops`);
           const data = await res.json();
-          allStops = data.data || data;
+          const raw = data.data || data;
+          // Normalize field names - API may use different keys
+          allStops = raw.map(s => ({
+            ...s,
+            name: s.name || s.stop_name || s.Nome || s.designation || s.short_name || s.id,
+            lat:  parseFloat(s.lat  || s.stop_lat  || s.latitude  || 0),
+            lon:  parseFloat(s.lon  || s.stop_lon  || s.longitude || s.lng || 0),
+            id:   s.id || s.stop_id,
+            lines: s.lines || s.routes || [],
+          }));
         }
 
         const nearby = allStops
@@ -600,27 +625,46 @@
         document.getElementById('stops-count').textContent = `${nearby.length} paragem${nearby.length > 1 ? 's' : ''}`;
         document.getElementById('empty-state').style.display = 'none';
 
-        // Fetch realtime for all stops in parallel
-        const rtResults = await Promise.allSettled(
-          nearby.map(async s => {
-            try {
-              const res = await fetch(`${API}/v2/stops/${s.id}/realtime`);
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-              const data = await res.json();
-              return data;
-            } catch (e) {
-              console.warn(`Erro ao obter realtime para paragem ${s.id}:`, e.message);
-              return [];
-            }
-          })
-        );
+        // Fetch realtime + stop detail for lines in parallel
+        const [rtResults, stopResults] = await Promise.all([
+          Promise.allSettled(
+            nearby.map(async s => {
+              try {
+                const res = await fetch(`${API}/v2/stops/${s.id}/realtime`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return await res.json();
+              } catch (e) {
+                console.warn(`Realtime error stop ${s.id}:`, e.message);
+                return [];
+              }
+            })
+          ),
+          Promise.allSettled(
+            nearby.map(async s => {
+              try {
+                const res = await fetch(`${API}/v2/stops/${s.id}`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return await res.json();
+              } catch (e) {
+                return null;
+              }
+            })
+          )
+        ]);
 
         const container = document.getElementById('stops-container');
         container.innerHTML = '';
 
         nearby.forEach((stop, i) => {
-          const rtData = rtResults[i].status === 'fulfilled' ? (rtResults[i].value.data || rtResults[i].value) : [];
-          container.appendChild(buildStopCard(stop, rtData));
+          const rtData = rtResults[i].status === 'fulfilled' ? (rtResults[i].value.data || rtResults[i].value || []) : [];
+          const stopDetail = stopResults[i].status === 'fulfilled' ? (stopResults[i].value?.data || stopResults[i].value) : null;
+          // Merge lines from stop detail if available
+          const enrichedStop = {
+            ...stop,
+            name: stopDetail?.name || stopDetail?.stop_name || stop.name,
+            lines: stopDetail?.lines || stopDetail?.routes || stop.lines || [],
+          };
+          container.appendChild(buildStopCard(enrichedStop, Array.isArray(rtData) ? rtData : []));
         });
 
         updateLastUpdate();
@@ -668,7 +712,16 @@
         .slice(0, 4);
 
       if (upcoming.length === 0) {
-        list.innerHTML = `<div class="no-arrivals">Sem chegadas previstas em breve</div>`;
+        // Show lines that serve this stop even if no realtime
+        const lines = stop.lines || [];
+        const linesHtml = lines.length > 0
+          ? `<div class="stop-lines">${lines.slice(0,10).map(l => {
+              const lid = typeof l === 'object' ? (l.id || l.route_id || l.line_id) : l;
+              const color = getLineColor(lid);
+              return `<span class="line-pill" style="background:${color}22;color:${color};border:1px solid ${color}44">${lid}</span>`;
+            }).join('')}</div>`
+          : '';
+        list.innerHTML = `${linesHtml}<div class="no-arrivals">Sem chegadas previstas em breve</div>`;
       } else {
         upcoming.forEach(a => {
           const color = getLineColor(a.line_id);
