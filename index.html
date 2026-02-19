@@ -8,6 +8,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>🚌 Próximos Autocarros</title>
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     :root {
       --bg: #0a0a0f;
@@ -181,6 +183,30 @@
       flex-wrap: wrap;
     }
 
+    /* SEARCH BAR */
+    .search-row {
+      margin-bottom: 20px;
+    }
+
+    #line-search {
+      width: 100%;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 14px;
+      outline: none;
+      transition: all 0.15s;
+    }
+
+    #line-search:focus {
+      border-color: var(--accent);
+      background: var(--surface2);
+      box-shadow: 0 0 0 4px rgba(245,166,35,0.1);
+    }
+
     .chip {
       padding: 5px 12px;
       border-radius: 20px;
@@ -262,10 +288,26 @@
 
     .stop-header {
       padding: 14px 16px;
-      border-bottom: 1px solid var(--border);
       display: flex;
       align-items: flex-start;
       gap: 12px;
+      cursor: pointer;
+      position: relative;
+    }
+
+    .stop-header::after {
+      content: '↓';
+      position: absolute;
+      right: 16px;
+      top: 14px;
+      font-size: 14px;
+      color: var(--muted);
+      transition: transform 0.3s;
+    }
+
+    .stop-card.expanded .stop-header::after {
+      transform: rotate(180deg);
+      color: var(--accent);
     }
 
     .stop-distance {
@@ -296,6 +338,29 @@
     /* ARRIVALS */
     .arrivals-list {
       padding: 8px 0;
+      display: none;
+      border-top: 1px solid var(--border);
+    }
+
+    .stop-card.expanded .arrivals-list {
+      display: block;
+    }
+
+    .map-wrap {
+      height: 0;
+      overflow: hidden;
+      transition: height 0.3s ease;
+      background: var(--surface2);
+    }
+
+    .stop-card.expanded .map-wrap {
+      height: 200px;
+      border-top: 1px solid var(--border);
+    }
+
+    .stop-map {
+      height: 100%;
+      width: 100%;
     }
 
     .arrival-row {
@@ -487,6 +552,10 @@
       </div>
     </div>
 
+    <div class="search-row">
+      <input type="text" id="line-search" placeholder="Filtrar por linha (ex: 4730)" oninput="onSearchInput()">
+    </div>
+
     <div class="update-info" id="update-info" style="display:none">
       <span class="section-title" id="stops-count"></span>
       <button id="refresh-btn" onclick="refresh()">
@@ -504,7 +573,7 @@
     <div id="empty-state">
       <div class="big-icon">🗺️</div>
       <h2>Nenhuma paragem encontrada</h2>
-      <p>Não há paragens da Carris Metropolitana num raio de <span id="empty-radius"></span>m. Tenta aumentar o raio de pesquisa.</p>
+      <p id="empty-msg">Não há paragens da Carris Metropolitana num raio de <span id="empty-radius"></span>m. Tenta aumentar o raio de pesquisa.</p>
     </div>
     <div id="last-update"></div>
   </div>
@@ -512,9 +581,12 @@
   <script>
     const API = 'https://api.carrismetropolitana.pt';
     let allStops = [];
+    let stopArrivals = {};
+    let allVehiclesData = [];
     let lineColors = {}; // cache de cores oficiais das linhas
     let userLat = null, userLon = null;
     let radius = 400;
+    let searchTerm = '';
     let autoRefreshTimer = null;
     let countdownTimer = null;
     let countdownSeconds = 30;
@@ -546,6 +618,15 @@
       if (userLat) loadNearbyStops();
     }
 
+    let searchTimeout;
+    function onSearchInput() {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => {
+        searchTerm = document.getElementById('line-search').value.trim();
+        if (userLat) loadNearbyStops();
+      }, 500);
+    }
+
     function setStatus(type, msg) {
       const dot = document.getElementById('status-dot');
       dot.className = 'status-dot' + (type === 'active' ? ' active' : type === 'error' ? ' error' : '');
@@ -569,7 +650,10 @@
           userLon = pos.coords.longitude;
           btn.disabled = false;
           label.textContent = 'Atualizar localização';
-          await loadNearbyStops();
+          await Promise.all([
+            loadNearbyStops(),
+            fetchVehicles()
+          ]);
           startAutoRefresh();
         },
         err => {
@@ -620,11 +704,15 @@
           }));
         }
 
-        const nearby = allStops
+        let nearby = allStops
           .map(s => ({ ...s, dist: haversine(userLat, userLon, s.lat, s.lon) }))
-          .filter(s => s.dist <= radius)
-          .sort((a, b) => a.dist - b.dist)
-          .slice(0, 6);
+          .filter(s => s.dist <= radius);
+
+        if (searchTerm) {
+          nearby = nearby.filter(s => s.lines && s.lines.some(l => l.includes(searchTerm)));
+        }
+
+        nearby = nearby.sort((a, b) => a.dist - b.dist).slice(0, 6);
 
         if (nearby.length === 0) {
           showEmpty();
@@ -653,11 +741,19 @@
         );
 
         const container = document.getElementById('stops-container');
+        // Limpar mapas ativos antes de limpar o contentor
+        Object.keys(activeMaps).forEach(sid => {
+          if (activeMaps[sid] && activeMaps[sid].map) activeMaps[sid].map.remove();
+        });
+        activeMaps = {};
+
         container.innerHTML = '';
 
         nearby.forEach((stop, i) => {
           const rtData = rtResults[i].status === 'fulfilled' ? (rtResults[i].value || []) : [];
-          container.appendChild(buildStopCard(stop, Array.isArray(rtData) ? rtData : []));
+          const arrivals = Array.isArray(rtData) ? rtData : [];
+          stopArrivals[stop.id] = arrivals;
+          container.appendChild(buildStopCard(stop, arrivals));
         });
 
         updateLastUpdate();
@@ -672,6 +768,7 @@
     function buildStopCard(stop, arrivals) {
       const card = document.createElement('div');
       card.className = 'stop-card';
+      card.id = `stop-card-${stop.id}`;
 
       const distStr = stop.dist < 1000
         ? `${Math.round(stop.dist)}m`
@@ -687,13 +784,16 @@
         : '';
 
       card.innerHTML = `
-        <div class="stop-header">
+        <div class="stop-header" onclick="toggleStop('${stop.id}')">
           <span class="stop-distance">${distStr}</span>
           <div style="flex:1;min-width:0">
             <div class="stop-name">${stop.name}</div>
             <div class="stop-id">#${stop.id}</div>
             ${linesPillsHtml}
           </div>
+        </div>
+        <div class="map-wrap" id="map-wrap-${stop.id}">
+          <div id="map-${stop.id}" class="stop-map"></div>
         </div>
         <div class="arrivals-list" id="arrivals-${stop.id}"></div>
       `;
@@ -770,8 +870,129 @@
     function showEmpty() {
       document.getElementById('stops-container').innerHTML = '';
       document.getElementById('empty-state').style.display = 'block';
-      document.getElementById('empty-radius').textContent = radius;
-      setStatus('error', 'Nenhuma paragem encontrada neste raio');
+      const msg = searchTerm
+        ? `Não foram encontradas paragens com a linha <b>${searchTerm}</b> num raio de ${radius}m.`
+        : `Não há paragens da Carris Metropolitana num raio de ${radius}m. Tenta aumentar o raio de pesquisa.`;
+      document.getElementById('empty-msg').innerHTML = msg;
+      setStatus('error', 'Nenhuma paragem encontrada');
+    }
+
+    let activeMaps = {};
+
+    function toggleStop(stopId) {
+      const card = document.getElementById(`stop-card-${stopId}`);
+      const isExpanding = !card.classList.contains('expanded');
+
+      card.classList.toggle('expanded');
+
+      if (isExpanding) {
+        setTimeout(() => {
+          initMap(stopId);
+        }, 300);
+      }
+    }
+
+    function initMap(stopId) {
+      if (activeMaps[stopId]) {
+        activeMaps[stopId].map.invalidateSize();
+        return;
+      }
+
+      const stop = allStops.find(s => s.id === stopId);
+      if (!stop) return;
+
+      const map = L.map(`map-${stopId}`, {
+        zoomControl: false,
+        attributionControl: false
+      });
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+      }).addTo(map);
+
+      // Ícone da paragem
+      const stopIcon = L.divIcon({
+        className: 'custom-div-icon',
+        html: "<div style='background-color:var(--accent); width:12px; height:12px; border-radius:50%; border:2px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);'></div>",
+        iconSize: [12, 12],
+        iconAnchor: [6, 6]
+      });
+      L.marker([stop.lat, stop.lon], { icon: stopIcon }).addTo(map).bindPopup(`<b>Paragem:</b> ${stop.name}`);
+
+      // Ícone do utilizador
+      if (userLat && userLon) {
+        const userIcon = L.divIcon({
+          className: 'custom-div-icon',
+          html: "<div style='background-color:#3b82f6; width:12px; height:12px; border-radius:50%; border:2px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);'></div>",
+          iconSize: [12, 12],
+          iconAnchor: [6, 6]
+        });
+        L.marker([userLat, userLon], { icon: userIcon }).addTo(map).bindPopup('<b>Estás aqui</b>');
+
+        const bounds = L.latLngBounds([[stop.lat, stop.lon], [userLat, userLon]]);
+        map.fitBounds(bounds, { padding: [40, 40] });
+      } else {
+        map.setView([stop.lat, stop.lon], 16);
+      }
+
+      activeMaps[stopId] = {
+        map: map,
+        busMarkers: {}
+      };
+
+      // Se houver chegadas, vamos tentar mostrar os autocarros
+      updateBusPositions(stopId);
+    }
+
+    async function fetchVehicles() {
+      try {
+        const res = await fetch(`${API}/v2/vehicles`);
+        const data = await res.json();
+        allVehiclesData = data.data || data;
+
+        // Atualiza todos os mapas ativos
+        Object.keys(activeMaps).forEach(sid => updateBusPositions(sid));
+      } catch (e) {
+        console.warn('Erro ao carregar veículos:', e);
+      }
+    }
+
+    function updateBusPositions(stopId) {
+      const entry = activeMaps[stopId];
+      if (!entry) return;
+
+      const { map, busMarkers } = entry;
+      const arrivals = stopArrivals[stopId] || [];
+      const vehicleIds = arrivals.map(a => a.vehicle_id).filter(id => id);
+
+      if (vehicleIds.length === 0) return;
+
+      const relevantVehicles = allVehiclesData.filter(v => vehicleIds.includes(v.id));
+
+      // Remover marcadores de veículos que já não estão nas chegadas
+      Object.keys(busMarkers).forEach(vid => {
+        if (!relevantVehicles.find(v => v.id === vid)) {
+          map.removeLayer(busMarkers[vid]);
+          delete busMarkers[vid];
+        }
+      });
+
+      relevantVehicles.forEach(v => {
+        const pos = [v.lat, v.lon];
+        if (busMarkers[v.id]) {
+          busMarkers[v.id].setLatLng(pos);
+        } else {
+          const busIcon = L.divIcon({
+            className: 'custom-div-icon',
+            html: `<div style='background-color:var(--green); width:20px; height:20px; border-radius:50%; border:2px solid white; display:flex; align-items:center; justify-content:center; font-size:12px; box-shadow: 0 0 10px rgba(0,0,0,0.3);'>🚌</div>`,
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
+          });
+          busMarkers[v.id] = L.marker(pos, { icon: busIcon })
+            .addTo(map)
+            .bindPopup(`<b>Linha ${v.line_id}</b><br>Destino: ${v.headsign || '—'}`);
+        }
+      });
     }
 
     function updateLastUpdate() {
@@ -783,7 +1004,10 @@
     async function refresh() {
       const icon = document.getElementById('refresh-icon');
       icon.classList.add('spin');
-      await loadNearbyStops();
+      await Promise.all([
+        loadNearbyStops(),
+        fetchVehicles()
+      ]);
       icon.classList.remove('spin');
       resetCountdown();
     }
@@ -803,7 +1027,10 @@
         updateCountdownBar();
         if (countdownSeconds <= 0) {
           clearInterval(countdownTimer);
-          loadNearbyStops().then(resetCountdown);
+          Promise.all([
+            loadNearbyStops(),
+            fetchVehicles()
+          ]).then(resetCountdown);
         }
       }, 1000);
     }
