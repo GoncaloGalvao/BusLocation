@@ -602,7 +602,17 @@
 
         // Fetch realtime for all stops in parallel
         const rtResults = await Promise.allSettled(
-          nearby.map(s => fetch(`${API}/v2/stops/${s.id}/realtime`).then(r => r.json()))
+          nearby.map(async s => {
+            try {
+              const res = await fetch(`${API}/v2/stops/${s.id}/realtime`);
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              const data = await res.json();
+              return data;
+            } catch (e) {
+              console.warn(`Erro ao obter realtime para paragem ${s.id}:`, e.message);
+              return [];
+            }
+          })
         );
 
         const container = document.getElementById('stops-container');
